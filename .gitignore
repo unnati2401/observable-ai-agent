@@ -1,0 +1,28 @@
+# Go
+bin/
+*.exe
+*.test
+*.out
+vendor/
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+
+# Logs
+*.log
+
+# Coverage
+coverage.out
+
+# Temporary
+tmp/
+
+# Podman
+podman-compose.override.yml
