@@ -12,11 +12,14 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
-func InitTracing(ctx context.Context) (func(context.Context) error, error) {
+// InitTracing wires OpenTelemetry to the OpenTelemetry Collector at endpoint
+// (e.g. "localhost:4317") and installs the SDK as the global tracer provider.
+// The returned shutdown function flushes and shuts down the provider.
+func InitTracing(ctx context.Context, endpoint string) (func(context.Context) error, error) {
 
 	exporter, err := otlptracegrpc.New(
 		ctx,
-		otlptracegrpc.WithEndpoint("localhost:4317"),
+		otlptracegrpc.WithEndpoint(endpoint),
 		otlptracegrpc.WithInsecure(),
 	)
 	if err != nil {

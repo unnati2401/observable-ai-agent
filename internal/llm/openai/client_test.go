@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -99,6 +100,9 @@ func TestGenerateToolCall(t *testing.T) {
 	if response.ToolCall == nil {
 		t.Fatal("ToolCall = nil, want non-nil")
 	}
+	if response.ToolCall.ID != "call_1" {
+		t.Errorf("ToolCall.ID = %q, want call_1", response.ToolCall.ID)
+	}
 	if response.ToolCall.Name != "get_weather" {
 		t.Errorf("ToolCall.Name = %q, want get_weather", response.ToolCall.Name)
 	}
@@ -122,9 +126,48 @@ func TestGenerateNoMessages(t *testing.T) {
 	}
 }
 
-func TestGenerateToolRoleUnsupported(t *testing.T) {
+func TestGenerateToolRoleRoundTrip(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("unexpected request to server")
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+
+		var request map[string]any
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+
+		messages, ok := request["messages"].([]any)
+		if !ok {
+			t.Fatalf("messages = %T, want []any", request["messages"])
+		}
+
+		want := []any{
+			map[string]any{"role": "system", "content": "You are a helpful assistant."},
+			map[string]any{"role": "user", "content": "What is the weather?"},
+			map[string]any{
+				"role": "assistant",
+				"tool_calls": []any{
+					map[string]any{
+						"id":   "call_1",
+						"type": "function",
+						"function": map[string]any{
+							"name":      "get_weather",
+							"arguments": `{"location":"New York"}`,
+						},
+					},
+				},
+			},
+			map[string]any{"role": "tool", "content": "Sunny, 25C", "tool_call_id": "call_1"},
+		}
+
+		if !reflect.DeepEqual(messages, want) {
+			t.Errorf("messages = %v\nwant      = %v", messages, want)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"It is sunny in New York."},"finish_reason":"stop"}]}`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -134,15 +177,147 @@ func TestGenerateToolRoleUnsupported(t *testing.T) {
 		WithModel("test-model"),
 	)
 
-	_, err := client.Generate(context.Background(), []agent.Message{
-		{Role: agent.ToolRole, Content: "result"},
+	response, err := client.Generate(context.Background(), []agent.Message{
+		{Role: agent.SystemRole, Content: "You are a helpful assistant."},
+		{Role: agent.UserRole, Content: "What is the weather?"},
+		{
+			Role: agent.AssistantRole,
+			ToolCall: &agent.ToolCall{
+				ID:    "call_1",
+				Name:  "get_weather",
+				Input: `{"location":"New York"}`,
+			},
+		},
+		{Role: agent.ToolRole, ToolCallID: "call_1", Content: "Sunny, 25C"},
 	}, nil)
-	if err == nil {
-		t.Fatal("Generate = nil error, want error")
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
 	}
-	if !strings.Contains(err.Error(), "tool messages") {
-		t.Errorf("error = %q, want mention of tool messages", err)
+	if response.Content != "It is sunny in New York." {
+		t.Errorf("Content = %q, want %q", response.Content, "It is sunny in New York.")
 	}
+	if response.ToolCall != nil {
+		t.Errorf("ToolCall = %+v, want nil", response.ToolCall)
+	}
+}
+
+func TestGenerateSendsToolDefinitions(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+
+		var request map[string]any
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+
+		tools, ok := request["tools"].([]any)
+		if !ok {
+			t.Fatalf("tools = %T, want []any", request["tools"])
+		}
+		if len(tools) != 1 {
+			t.Fatalf("len(tools) = %d, want 1", len(tools))
+		}
+
+		want := map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "get_weather",
+				"description": "Get the weather for a location.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"location": map[string]any{
+							"type": "string",
+						},
+					},
+					"required": []any{"location"},
+				},
+			},
+		}
+		if !reflect.DeepEqual(tools[0], want) {
+			t.Errorf("tool = %v\nwant      = %v", tools[0], want)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"I can help with that."},"finish_reason":"stop"}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(
+		WithBaseURL(server.URL),
+		WithAPIKey("test-key"),
+		WithModel("test-model"),
+	)
+
+	response, err := client.Generate(context.Background(), []agent.Message{
+		{Role: agent.UserRole, Content: "What is the weather?"},
+	}, []agent.Tool{testTool{name: "get_weather", description: "Get the weather for a location."}})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if response.Content != "I can help with that." {
+		t.Errorf("Content = %q, want response", response.Content)
+	}
+}
+
+func TestGenerateSendsToolDefinitionsEmpty(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+
+		var request map[string]any
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+
+		if _, present := request["tools"]; present {
+			t.Errorf("tools present in request, want absent when no tools registered")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"Hi!"},"finish_reason":"stop"}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(
+		WithBaseURL(server.URL),
+		WithAPIKey("test-key"),
+		WithModel("test-model"),
+	)
+
+	if _, err := client.Generate(context.Background(), []agent.Message{
+		{Role: agent.UserRole, Content: "Hello!"},
+	}, nil); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+}
+
+type testTool struct {
+	name        string
+	description string
+}
+
+func (t testTool) Definition() agent.ToolDefinition {
+	return agent.ToolDefinition{
+		Name:        t.name,
+		Description: t.description,
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"location": map[string]any{"type": "string"},
+			},
+			"required": []any{"location"},
+		},
+	}
+}
+
+func (t testTool) Execute(_ context.Context, _ string) (string, error) {
+	return "", nil
 }
 
 func TestGenerateServerError(t *testing.T) {

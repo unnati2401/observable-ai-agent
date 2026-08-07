@@ -5,11 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/unnati2401/observable-ai-agent/internal/agent"
+	"github.com/unnati2401/observable-ai-agent/internal/otelutil"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const DefaultModel = "gpt-4o-mini"
@@ -70,19 +75,47 @@ func NewClient(opts ...Option) *Client {
 }
 
 func (c *Client) Generate(ctx context.Context, messages []agent.Message, tools []agent.Tool) (*agent.LLMResponse, error) {
-	if len(messages) == 0 {
-		return nil, errors.New("openai: no messages provided")
-	}
+	ctx, span := tracer.Start(ctx, "LLM.Generate", trace.WithAttributes(
+		attribute.String("llm.provider", "openai"),
+		attribute.String("llm.model", c.model),
+	))
+	defer span.End()
 
-	params, err := toChatParams(c.model, messages)
-	if err != nil {
+	if len(messages) == 0 {
+		err := errors.New("openai: no messages provided")
+		otelutil.RecordError(span, err)
 		return nil, err
 	}
 
-	completion, err := c.api.Chat.Completions.New(ctx, params)
+	params, err := toChatParams(c.model, messages, tools)
 	if err != nil {
+		otelutil.RecordError(span, err)
+		return nil, err
+	}
+
+	span.SetAttributes(attribute.Int("llm.request_size", requestSize(params)))
+	if len(tools) > 0 {
+		span.SetAttributes(attribute.Int("llm.tools.count", len(tools)))
+	}
+
+	start := time.Now()
+	completion, err := c.api.Chat.Completions.New(ctx, params)
+	span.SetAttributes(attribute.Float64("llm.latency", time.Since(start).Seconds()))
+	if err != nil {
+		otelutil.RecordError(span, err)
 		return nil, fmt.Errorf("openai: chat completion: %w", err)
 	}
 
-	return toLLMResponse(completion)
+	span.SetAttributes(attribute.Int("llm.response_size", responseSize(completion)))
+
+	response, err := toLLMResponse(completion)
+	if err != nil {
+		otelutil.RecordError(span, err)
+		return nil, err
+	}
+
+	if response.ToolCall != nil {
+		span.SetAttributes(attribute.String("llm.tool_calls", response.ToolCall.Name))
+	}
+	return response, nil
 }
